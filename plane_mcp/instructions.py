@@ -18,4 +18,6 @@ items always belong to a project; ask which if one is not named.
    `workitem delete` by work item id (set parent=<work item id> to nest).
 5. List an epic's children: `workitem list` with pql='childOf("<EPIC-IDENTIFIER>")'
    using the epic's human-readable identifier (e.g. "PROJ-12") from `workitem retrieve`.
+A project may use its own epic type instead of "Epic" (e.g. "Epic - Creative People"):
+list the project's types and resolve the type by the name that project uses.
 """

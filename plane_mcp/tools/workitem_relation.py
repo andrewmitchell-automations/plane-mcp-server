@@ -3,6 +3,12 @@
 Two systems behind one tool: built-in dependencies (six fixed directional types)
 and custom relations (workspace-defined, each with an outward and inward label).
 `create` routes between them by which arguments are supplied.
+
+Servers without the Commercial dependency routes (Plane CE, PaperPlane) answer them
+with 404. There, list/create/delete fall back to the v1 `relations/` routes, which
+carry the dependency types plus relates_to and duplicate. A 404 from a write can
+also mean "no such relation", so the route is probed with a read before a write
+falls back.
 """
 
 from __future__ import annotations
@@ -10,6 +16,8 @@ from __future__ import annotations
 from typing import Any, Literal, get_args
 
 from fastmcp import FastMCP
+from plane.errors.errors import HttpError
+from plane.models.enums import WorkItemRelationTypeEnum
 from plane.models.work_item_relation_definitions import (
     CreateWorkItemRelationDefinition,
     PaginatedWorkItemRelationDefinitionResponse,
@@ -19,7 +27,9 @@ from plane.models.work_item_relation_definitions import (
 from plane.models.work_items import (
     CreateWorkItemCustomRelation,
     CreateWorkItemDependency,
+    CreateWorkItemRelation,
     DependencyTypeEnum,
+    RemoveWorkItemRelation,
 )
 
 from plane_mcp.client import get_plane_client_context
@@ -38,6 +48,8 @@ NAME = "workitem_relation"
 TITLE = "Work item relations"
 
 DEPENDENCY_TYPES: tuple[str, ...] = get_args(DependencyTypeEnum)
+# The v1 relations API: the dependency types plus relates_to and duplicate.
+RELATION_TYPES: tuple[str, ...] = get_args(WorkItemRelationTypeEnum)
 
 _OTHER_RELATIONS = (
     "For any other relationship pass relation_definition_id and "
@@ -70,7 +82,9 @@ FOOTER = (
     "Call list_definitions first and match the user's wording to an entry. A "
     f"built_in_dependencies value ({', '.join(DEPENDENCY_TYPES)}) goes in relation_type; a "
     "custom definition needs its id in relation_definition_id and the matched outward or "
-    "inward label in relation_definition_label, which sets direction."
+    "inward label in relation_definition_label, which sets direction. On a server without "
+    "dependency routes (Plane CE, PaperPlane) relations use the v1 API instead, where "
+    "relation_type also accepts relates_to and duplicate, and custom relations are unavailable."
 )
 
 LEGACY = {
@@ -100,6 +114,57 @@ def _all_definitions(client, workspace_slug: str, is_default, is_active) -> list
         cursor = page.next_cursor
         if not page.next_page_results or not cursor:
             return results
+
+
+def _is_missing_route(exc: HttpError) -> bool:
+    return exc.status_code == 404
+
+
+def _lacks_dependency_routes(client, workspace_slug: str, project_id: str, workitem_id: str) -> bool:
+    """True when the server has no Commercial dependency routes, judged by a read.
+
+    A write's 404 can mean a missing relation as well as a missing route; this read
+    answers 200 wherever the routes exist, so production never reaches the fallback.
+    """
+    try:
+        client.work_items.dependencies.list(
+            workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
+        )
+    except HttpError as exc:
+        return _is_missing_route(exc)
+    return False
+
+
+def _v1_list(client, workspace_slug: str, project_id: str, workitem_id: str) -> dict[str, Any]:
+    """The v1 relations, in the shape of the Commercial list; there are no custom relations.
+
+    Read raw: the SDK's WorkItemRelationResponse types each entry as an id, but the
+    server returns work item objects, so validating against it fails on any relation.
+    """
+    relations = client.work_items.relations._get(
+        f"{workspace_slug}/projects/{project_id}/work-items/{workitem_id}/relations"
+    )
+
+    def entries(kind: str) -> list[dict[str, Any]]:
+        return [item if isinstance(item, dict) else {"id": item} for item in (relations or {}).get(kind) or []]
+
+    return {
+        "dependencies": {kind: entries(kind) for kind in DEPENDENCY_TYPES},
+        "relations": {kind: entries(kind) for kind in RELATION_TYPES if kind not in DEPENDENCY_TYPES},
+        "custom": {},
+    }
+
+
+def _v1_create(client, workspace_slug: str, project_id: str, workitem_id: str, relation_type: str, targets) -> Any:
+    result = client.work_items.relations.create(
+        workspace_slug=workspace_slug,
+        project_id=project_id,
+        work_item_id=workitem_id,
+        data=CreateWorkItemRelation(relation_type=relation_type, issues=targets),  # type: ignore[arg-type]
+    )
+    if result is not None:
+        return result
+    return {"relation_type": relation_type, "workitem_ids": targets}
 
 
 def register(mcp: FastMCP) -> None:
@@ -183,12 +248,22 @@ def register(mcp: FastMCP) -> None:
             return error
 
         if action == "list":
-            dependencies = client.work_items.dependencies.list(
-                workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
-            )
-            custom = client.work_items.custom_relations.list(
-                workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
-            )
+            try:
+                dependencies = client.work_items.dependencies.list(
+                    workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
+                )
+                custom = client.work_items.custom_relations.list(
+                    workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
+                )
+            except HttpError as exc:
+                if not _is_missing_route(exc):
+                    raise
+                try:
+                    return _v1_list(client, workspace_slug, project_id, workitem_id)
+                except HttpError as fallback:
+                    if _is_missing_route(fallback):
+                        raise exc from None
+                    raise
             return {
                 "dependencies": dependencies.model_dump(),
                 "custom": {label: [item.model_dump() for item in items] for label, items in custom.items()},
@@ -199,17 +274,29 @@ def register(mcp: FastMCP) -> None:
             if not targets:
                 return missing(action, "workitem_ids")
             if relation_type:
+                if relation_type in RELATION_TYPES and relation_type not in DEPENDENCY_TYPES:
+                    # relates_to / duplicate exist only in the v1 API.
+                    if _lacks_dependency_routes(client, workspace_slug, project_id, workitem_id):
+                        return _v1_create(client, workspace_slug, project_id, workitem_id, relation_type, targets)
                 if error := one_of("relation_type", relation_type, DEPENDENCY_TYPES, _OTHER_RELATIONS):
                     return error
-                return client.work_items.dependencies.create(
-                    workspace_slug=workspace_slug,
-                    project_id=project_id,
-                    work_item_id=workitem_id,
-                    data=CreateWorkItemDependency(
-                        relation_type=relation_type,  # type: ignore[arg-type]
-                        work_item_ids=targets,
-                    ),
-                )
+                try:
+                    return client.work_items.dependencies.create(
+                        workspace_slug=workspace_slug,
+                        project_id=project_id,
+                        work_item_id=workitem_id,
+                        data=CreateWorkItemDependency(
+                            relation_type=relation_type,  # type: ignore[arg-type]
+                            work_item_ids=targets,
+                        ),
+                    )
+                except HttpError as exc:
+                    if not (
+                        _is_missing_route(exc)
+                        and _lacks_dependency_routes(client, workspace_slug, project_id, workitem_id)
+                    ):
+                        raise
+                    return _v1_create(client, workspace_slug, project_id, workitem_id, relation_type, targets)
             if relation_definition_id and relation_definition_label:
                 return client.work_items.custom_relations.create(
                     workspace_slug=workspace_slug,
@@ -230,10 +317,23 @@ def register(mcp: FastMCP) -> None:
         if not related_workitem_id:
             return missing(action, "related_workitem_id")
         remove = client.work_items.dependencies.remove if is_dependency else client.work_items.custom_relations.remove
-        remove(
-            workspace_slug=workspace_slug,
-            project_id=project_id,
-            work_item_id=workitem_id,
-            related_work_item_id=related_workitem_id,
-        )
+        try:
+            remove(
+                workspace_slug=workspace_slug,
+                project_id=project_id,
+                work_item_id=workitem_id,
+                related_work_item_id=related_workitem_id,
+            )
+        except HttpError as exc:
+            if not (
+                _is_missing_route(exc) and _lacks_dependency_routes(client, workspace_slug, project_id, workitem_id)
+            ):
+                raise
+            # v1 keeps one relation per pair, whatever its kind, so is_dependency does not matter here.
+            client.work_items.relations.delete(
+                workspace_slug=workspace_slug,
+                project_id=project_id,
+                work_item_id=workitem_id,
+                data=RemoveWorkItemRelation(related_issue=related_workitem_id),
+            )
         return None

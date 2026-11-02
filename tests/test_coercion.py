@@ -200,7 +200,8 @@ def _invoke(tool: str, arguments: dict, module: str | None = None):
 
 
 def _work_item_args(assignees) -> dict:
-    return {"action": "create", "project_id": "p", "name": "One", "assignees": assignees}
+    # type_id skips the default-type lookup, so the create is the first SDK call.
+    return {"action": "create", "project_id": "p", "name": "One", "type_id": "t", "assignees": assignees}
 
 
 @pytest.mark.parametrize("sent", [f'["{ASSIGNEE}"]', [ASSIGNEE]], ids=["stringified", "proper-list"])

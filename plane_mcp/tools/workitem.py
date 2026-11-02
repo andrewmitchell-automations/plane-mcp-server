@@ -145,6 +145,7 @@ FOOTER = (
     f"priority: {', '.join(PRIORITIES)}.\n"
     "UUID fields (assignees, labels, state, parent, type_id) need UUIDs -- list the relevant "
     "resource first if you only have a name.\n"
+    'create without type_id uses the project\'s default type (else its "Task" type).\n'
     "description_stripped is plain text and is wrapped into HTML on save; description_html wins "
     "if both are given.\n"
     "To clear a field on update: assignees=[] or labels=[], and start_date=null or "
@@ -177,6 +178,27 @@ def _scoped_pql(pql: str, project_id: str) -> str:
         return pql
     scope = f'project = "{project_id}"'
     return f"({pql}) AND {scope}" if pql else scope
+
+
+# Used when a project marks no type as its default.
+FALLBACK_TYPE_NAME = "Task"
+
+
+def _default_type_id(client, workspace_slug: str, project_id: str) -> str | None:
+    """The type a create without type_id should carry: the project's default, else its "Task".
+
+    Plane Commercial fills in the default type itself; servers built on the community API
+    (PaperPlane) refuse a create without type_id. Sending the default explicitly works on
+    both. A project whose types cannot be listed keeps today's create, with no type_id.
+    """
+    try:
+        types = client.work_item_types.list(workspace_slug=workspace_slug, project_id=project_id)
+    except (HttpError, ValueError):
+        return None
+    chosen = next((t for t in types if t.is_default), None) or next(
+        (t for t in types if (t.name or "").strip() == FALLBACK_TYPE_NAME), None
+    )
+    return chosen.id if chosen is not None else None
 
 
 def register(mcp: FastMCP) -> None:
@@ -352,10 +374,13 @@ def register(mcp: FastMCP) -> None:
         if action == "create":
             if not name:
                 return missing(action, "name")
+            payload = write_payload()
+            if "type_id" not in payload and (default := _default_type_id(client, workspace_slug, project_id)):
+                payload["type_id"] = default
             return client.work_items.create(
                 workspace_slug=workspace_slug,
                 project_id=project_id,
-                data=CreateWorkItem(**write_payload()),
+                data=CreateWorkItem(**payload),
             )
 
         if not workitem_id:

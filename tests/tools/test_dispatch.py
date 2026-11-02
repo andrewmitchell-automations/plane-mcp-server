@@ -240,7 +240,8 @@ def test_an_unrecognised_workitem_value_is_refused_not_dropped(args, named, regi
 def test_a_valid_priority_still_reaches_the_sdk(registered, spy):
     registered["workitem"].fn(action="create", project_id="p", name="x", priority="urgent")
 
-    assert spy.recorder.only().kwargs["data"].priority == "urgent"
+    (create,) = [call for call in spy.recorder.calls if call.method == "work_items.create"]
+    assert create.kwargs["data"].priority == "urgent"
 
 
 @pytest.mark.parametrize(

@@ -83,14 +83,14 @@ def test_list_uses_the_commercial_routes_when_they_exist(registered, spy):
 def test_list_falls_back_to_v1_relations_on_404(registered, spy):
     spy.returns["work_items.dependencies.list"] = NOT_FOUND
     # The server sends work item objects, not the ids the SDK model declares.
-    blocker = {"id": "b1", "name": "Blocker", "project_id": "p", "sequence_id": 7}
+    blocker = {"project_id": "p", "issue_id": "b1"}
     spy.returns["work_items.relations._get"] = _relations(blocked_by=[blocker], relates_to=["r1"])
 
     result = _relation(registered, "list")
 
     (call,) = [c for c in spy.recorder.calls if c.method == "work_items.relations._get"]
     assert call.kwargs["endpoint"] == "acme/projects/p/work-items/w/relations"
-    assert result["dependencies"]["blocked_by"] == [blocker]
+    assert result["dependencies"]["blocked_by"] == [{"id": "b1", "project_id": "p", "issue_id": "b1"}]
     assert result["dependencies"]["blocking"] == []
     assert result["relations"]["relates_to"] == [{"id": "r1"}]
     assert result["custom"] == {}

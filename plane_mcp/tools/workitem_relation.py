@@ -145,8 +145,14 @@ def _v1_list(client, workspace_slug: str, project_id: str, workitem_id: str) -> 
         f"{workspace_slug}/projects/{project_id}/work-items/{workitem_id}/relations"
     )
 
+    def entry(item: Any) -> dict[str, Any]:
+        # Entries carry the related item as issue_id; expose it as id, like the Commercial list.
+        if not isinstance(item, dict):
+            return {"id": item}
+        return {"id": item.get("issue_id") or item.get("id"), **{k: v for k, v in item.items() if k != "id"}}
+
     def entries(kind: str) -> list[dict[str, Any]]:
-        return [item if isinstance(item, dict) else {"id": item} for item in (relations or {}).get(kind) or []]
+        return [entry(item) for item in (relations or {}).get(kind) or []]
 
     return {
         "dependencies": {kind: entries(kind) for kind in DEPENDENCY_TYPES},
